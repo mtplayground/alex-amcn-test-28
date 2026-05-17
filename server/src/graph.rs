@@ -115,6 +115,26 @@ impl GraphIndex {
         self.edge_indices.contains_key(&rel_id)
     }
 
+    pub fn incident_rel_ids(&self, node_id: NodeId) -> Vec<RelId> {
+        let Some(node_index) = self.node_indices.get(&node_id).copied() else {
+            return Vec::new();
+        };
+
+        let outgoing = self
+            .graph
+            .edges_directed(node_index, Direction::Outgoing)
+            .map(|edge| *edge.weight());
+        let incoming = self
+            .graph
+            .edges_directed(node_index, Direction::Incoming)
+            .map(|edge| *edge.weight());
+
+        let mut rel_ids = outgoing.chain(incoming).collect::<Vec<_>>();
+        rel_ids.sort_unstable();
+        rel_ids.dedup();
+        rel_ids
+    }
+
     fn rebuild_mappings(&mut self) {
         self.node_indices = self
             .graph
@@ -172,6 +192,21 @@ mod tests {
         assert_eq!(index.relationship_count(), 0);
         assert!(!index.contains_rel(12));
         assert!(index.contains_node(3));
+    }
+
+    #[test]
+    fn incident_relationship_lookup_returns_sorted_unique_ids() {
+        let mut index = GraphIndex::new();
+
+        index.add_node(1);
+        index.add_node(2);
+        index.add_node(3);
+        index.add_rel(12, 1, 2);
+        index.add_rel(11, 3, 1);
+
+        assert_eq!(index.incident_rel_ids(1), vec![11, 12]);
+        assert_eq!(index.incident_rel_ids(2), vec![12]);
+        assert!(index.incident_rel_ids(99).is_empty());
     }
 
     #[tokio::test]

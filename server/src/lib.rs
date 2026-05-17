@@ -3,6 +3,7 @@
 pub mod config;
 pub mod db;
 pub mod domain;
+pub mod executor;
 pub mod graph;
 pub mod lexer;
 pub mod parser;
