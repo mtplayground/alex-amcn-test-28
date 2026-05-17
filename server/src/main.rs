@@ -3,7 +3,7 @@ use std::error::Error;
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use zeroclaw_server::{app_with_pool, config::Config, db::create_pool, graph::GraphIndex};
+use zeroclaw_server::{app_with_state, config::Config, db::create_pool, graph::GraphIndex};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -25,9 +25,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     info!(address = %config.bind_address, "server listening");
 
-    let _graph_index = graph_index;
-
-    axum::serve(listener, app_with_pool(pool)).await?;
+    axum::serve(listener, app_with_state(pool, graph_index)).await?;
 
     Ok(())
 }
