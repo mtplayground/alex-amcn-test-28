@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use serde_json::Value as JsonValue;
@@ -6,11 +6,11 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::{
     db::{NodeRepo, RelRepo},
-    domain::{Node, NodeId, Properties, RelId, Relationship},
+    domain::{Node, NodeId, Properties, QueryResult, RelId, Relationship},
     graph::GraphIndex,
     parser::{
         BinaryOperator, Clause, CreateClause, DeleteClause, Expression, Literal, NodePattern,
-        Query, RelationshipPattern,
+        Query, RelationshipPattern, ReturnClause,
     },
 };
 
@@ -27,13 +27,6 @@ pub struct CreateSummary {
     pub bindings: Binding,
     pub created_nodes: Vec<Node>,
     pub created_relationships: Vec<Relationship>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct MatchSummary {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<JsonValue>>,
-    pub bindings: Vec<Binding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +127,7 @@ pub async fn execute_match_query(
     pool: &PgPool,
     graph_index: &GraphIndex,
     query: &Query,
-) -> Result<MatchSummary, ExecutorError> {
+) -> Result<QueryResult, ExecutorError> {
     let node_repo = NodeRepo::new(pool.clone());
     let rel_repo = RelRepo::new(pool.clone());
     let nodes = node_repo.list().await?;
@@ -192,27 +185,7 @@ pub async fn execute_match_query(
         bindings.truncate(limit_clause.count);
     }
 
-    let columns = return_clause
-        .items
-        .iter()
-        .map(|projection| projection_name(&projection.expression))
-        .collect::<Vec<_>>();
-    let rows = bindings
-        .iter()
-        .map(|binding| {
-            return_clause
-                .items
-                .iter()
-                .map(|projection| project_value(&projection.expression, binding))
-                .collect::<Result<Vec<_>, ExecutorError>>()
-        })
-        .collect::<Result<Vec<_>, ExecutorError>>()?;
-
-    Ok(MatchSummary {
-        columns,
-        rows,
-        bindings,
-    })
+    build_query_result(return_clause, &bindings, &node_map)
 }
 
 pub async fn execute_delete(
@@ -563,6 +536,50 @@ fn compare_values(
     })
 }
 
+fn build_query_result(
+    return_clause: &ReturnClause,
+    bindings: &[Binding],
+    nodes_by_id: &HashMap<NodeId, Node>,
+) -> Result<QueryResult, ExecutorError> {
+    let columns = return_clause
+        .items
+        .iter()
+        .map(|projection| projection_name(&projection.expression))
+        .collect::<Vec<_>>();
+    let rows = bindings
+        .iter()
+        .map(|binding| {
+            return_clause
+                .items
+                .iter()
+                .map(|projection| project_value(&projection.expression, binding))
+                .collect::<Result<Vec<_>, ExecutorError>>()
+        })
+        .collect::<Result<Vec<_>, ExecutorError>>()?;
+
+    let mut result_nodes = BTreeMap::new();
+    let mut result_relationships = BTreeMap::new();
+
+    for binding in bindings {
+        for projection in &return_clause.items {
+            collect_projected_graph_entities(
+                &projection.expression,
+                binding,
+                nodes_by_id,
+                &mut result_nodes,
+                &mut result_relationships,
+            )?;
+        }
+    }
+
+    Ok(QueryResult {
+        columns,
+        rows,
+        nodes: result_nodes.into_values().collect(),
+        relationships: result_relationships.into_values().collect(),
+    })
+}
+
 fn project_value(expression: &Expression, binding: &Binding) -> Result<JsonValue, ExecutorError> {
     match expression {
         Expression::Identifier(identifier) => {
@@ -600,6 +617,48 @@ fn projection_name(expression: &Expression) -> String {
         },
         Expression::Binary { .. } => "expr".to_string(),
     }
+}
+
+fn collect_projected_graph_entities(
+    expression: &Expression,
+    binding: &Binding,
+    nodes_by_id: &HashMap<NodeId, Node>,
+    result_nodes: &mut BTreeMap<NodeId, Node>,
+    result_relationships: &mut BTreeMap<RelId, Relationship>,
+) -> Result<(), ExecutorError> {
+    let Expression::Identifier(identifier) = expression else {
+        return Ok(());
+    };
+
+    let Some(bound) = binding.get(identifier) else {
+        return Err(ExecutorError {
+            message: format!("unbound identifier '{}'", identifier),
+        });
+    };
+
+    match bound {
+        BoundValue::Node(node) => {
+            result_nodes.entry(node.id).or_insert_with(|| node.clone());
+        }
+        BoundValue::Relationship(relationship) => {
+            result_relationships
+                .entry(relationship.id)
+                .or_insert_with(|| relationship.clone());
+
+            if let Some(start_node) = nodes_by_id.get(&relationship.start_id) {
+                result_nodes
+                    .entry(start_node.id)
+                    .or_insert_with(|| start_node.clone());
+            }
+            if let Some(end_node) = nodes_by_id.get(&relationship.end_id) {
+                result_nodes
+                    .entry(end_node.id)
+                    .or_insert_with(|| end_node.clone());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn literal_to_json(literal: &Literal) -> JsonValue {
@@ -891,7 +950,8 @@ mod tests {
                 JsonValue::String("primary".to_string())
             ]]
         );
-        assert_eq!(summary.bindings.len(), 1);
+        assert!(summary.nodes.is_empty());
+        assert!(summary.relationships.is_empty());
     }
 
     #[tokio::test]
@@ -962,6 +1022,8 @@ mod tests {
                 JsonValue::String("fast".to_string())
             ]
         );
+        assert!(summary.nodes.is_empty());
+        assert!(summary.relationships.is_empty());
     }
 
     #[tokio::test]
@@ -980,7 +1042,7 @@ mod tests {
         let primary = insert_named_node(&node_repo, "Database", "primary").await;
         let archive = insert_named_node(&node_repo, "Database", "archive").await;
 
-        rel_repo
+        let primary_dependency = rel_repo
             .insert(
                 "DEPENDS_ON".to_string(),
                 api.id,
@@ -989,7 +1051,7 @@ mod tests {
             )
             .await
             .expect("first relationship insert should succeed");
-        rel_repo
+        let archive_dependency = rel_repo
             .insert(
                 "DEPENDS_ON".to_string(),
                 api.id,
@@ -1018,6 +1080,18 @@ mod tests {
         assert!(summary.rows.iter().any(|row| row[2] == JsonValue::String("archive".to_string())));
         assert!(summary.rows.iter().all(|row| row[0].get("id").is_some()));
         assert!(summary.rows.iter().all(|row| row[1].get("type").is_some()));
+        assert_eq!(
+            summary.nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>(),
+            BTreeSet::from([api.id, primary.id, archive.id])
+        );
+        assert_eq!(
+            summary
+                .relationships
+                .iter()
+                .map(|relationship| relationship.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([primary_dependency.id, archive_dependency.id])
+        );
     }
 
     #[tokio::test]

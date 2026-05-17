@@ -23,6 +23,14 @@ pub struct Relationship {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<JsonValue>>,
+    pub nodes: Vec<Node>,
+    pub relationships: Vec<Relationship>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
     String(String),
@@ -33,7 +41,7 @@ pub enum Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, Relationship, Value};
+    use super::{Node, QueryResult, Relationship, Value};
     use serde_json::{json, Map, Number, Value as JsonValue};
 
     #[test]
@@ -93,6 +101,84 @@ mod tests {
                 "start_id": 7,
                 "end_id": 8,
                 "properties": {}
+            })
+        );
+    }
+
+    #[test]
+    fn query_result_serializes_rows_and_graph_entities() {
+        let mut node_properties = Map::new();
+        node_properties.insert("name".to_string(), JsonValue::String("api".to_string()));
+        let node = Node {
+            id: 7,
+            labels: vec!["Service".to_string()],
+            properties: node_properties,
+        };
+        let relationship = Relationship {
+            id: 9,
+            r#type: "DEPENDS_ON".to_string(),
+            start_id: 7,
+            end_id: 8,
+            properties: Map::new(),
+        };
+        let result = QueryResult {
+            columns: vec!["service".to_string(), "service.name".to_string()],
+            rows: vec![vec![
+                json!({
+                    "id": 7,
+                    "labels": ["Service"],
+                    "properties": {
+                        "name": "api"
+                    }
+                }),
+                JsonValue::String("api".to_string()),
+            ]],
+            nodes: vec![node],
+            relationships: vec![relationship],
+        };
+
+        let serialized = serde_json::to_value(result);
+        assert!(serialized.is_ok());
+
+        let serialized = match serialized {
+            Ok(serialized) => serialized,
+            Err(error) => panic!("query result should serialize: {error}"),
+        };
+
+        assert_eq!(
+            serialized,
+            json!({
+                "columns": ["service", "service.name"],
+                "rows": [
+                    [
+                        {
+                            "id": 7,
+                            "labels": ["Service"],
+                            "properties": {
+                                "name": "api"
+                            }
+                        },
+                        "api"
+                    ]
+                ],
+                "nodes": [
+                    {
+                        "id": 7,
+                        "labels": ["Service"],
+                        "properties": {
+                            "name": "api"
+                        }
+                    }
+                ],
+                "relationships": [
+                    {
+                        "id": 9,
+                        "type": "DEPENDS_ON",
+                        "start_id": 7,
+                        "end_id": 8,
+                        "properties": {}
+                    }
+                ]
             })
         );
     }
