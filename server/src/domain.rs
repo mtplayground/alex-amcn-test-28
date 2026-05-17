@@ -31,6 +31,12 @@ pub struct QueryResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphData {
+    pub nodes: Vec<Node>,
+    pub relationships: Vec<Relationship>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
     String(String),
@@ -41,7 +47,7 @@ pub enum Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, QueryResult, Relationship, Value};
+    use super::{GraphData, Node, QueryResult, Relationship, Value};
     use serde_json::{json, Map, Number, Value as JsonValue};
 
     #[test]
@@ -168,6 +174,54 @@ mod tests {
                         "properties": {
                             "name": "api"
                         }
+                    }
+                ],
+                "relationships": [
+                    {
+                        "id": 9,
+                        "type": "DEPENDS_ON",
+                        "start_id": 7,
+                        "end_id": 8,
+                        "properties": {}
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn graph_data_serializes_nodes_and_relationships() {
+        let graph = GraphData {
+            nodes: vec![Node {
+                id: 7,
+                labels: vec!["Service".to_string()],
+                properties: Map::new(),
+            }],
+            relationships: vec![Relationship {
+                id: 9,
+                r#type: "DEPENDS_ON".to_string(),
+                start_id: 7,
+                end_id: 8,
+                properties: Map::new(),
+            }],
+        };
+
+        let serialized = serde_json::to_value(graph);
+        assert!(serialized.is_ok());
+
+        let serialized = match serialized {
+            Ok(serialized) => serialized,
+            Err(error) => panic!("graph data should serialize: {error}"),
+        };
+
+        assert_eq!(
+            serialized,
+            json!({
+                "nodes": [
+                    {
+                        "id": 7,
+                        "labels": ["Service"],
+                        "properties": {}
                     }
                 ],
                 "relationships": [

@@ -100,6 +100,22 @@ impl NodeRepo {
         rows.iter().map(node_from_row).collect()
     }
 
+    pub async fn list_limit(&self, limit: usize) -> Result<Vec<Node>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, labels, properties
+            FROM nodes
+            ORDER BY id
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::try_from(limit).expect("limit should fit in BIGINT"))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(node_from_row).collect()
+    }
+
     pub async fn delete(&self, id: i64) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
@@ -249,6 +265,22 @@ impl RelRepo {
             ORDER BY id
             "#,
         )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(relationship_from_row).collect()
+    }
+
+    pub async fn list_limit(&self, limit: usize) -> Result<Vec<Relationship>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, type, start_id, end_id, properties
+            FROM relationships
+            ORDER BY id
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::try_from(limit).expect("limit should fit in BIGINT"))
         .fetch_all(&self.pool)
         .await?;
 
