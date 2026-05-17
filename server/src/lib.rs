@@ -12,17 +12,22 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::sync::Arc;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
+use tokio::sync::Mutex;
 
 use crate::{
     db::{NodeRepo, RelRepo},
     domain::GraphData,
+    executor::execute_query,
+    graph::GraphIndex,
+    parser::parse,
 };
 
 /// Returns the backend workspace member name.
@@ -39,10 +44,13 @@ pub fn app() -> Router {
 }
 
 /// Builds the application router with database-backed API routes.
-pub fn app_with_pool(pool: PgPool) -> Router {
+pub fn app_with_state(pool: PgPool, graph_index: GraphIndex) -> Router {
     Router::new()
         .nest("/api", api_router())
-        .with_state(AppState { pool })
+        .with_state(AppState {
+            pool,
+            graph_index: Arc::new(Mutex::new(graph_index)),
+        })
         .fallback_service(spa_service())
         .layer(TraceLayer::new_for_http())
 }
@@ -51,6 +59,7 @@ fn api_router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health_check))
         .route("/graph", get(graph_handler))
+        .route("/query", post(query_handler))
 }
 
 fn spa_service() -> ServeDir<ServeFile> {
@@ -60,6 +69,7 @@ fn spa_service() -> ServeDir<ServeFile> {
 #[derive(Debug, Clone)]
 struct AppState {
     pool: PgPool,
+    graph_index: Arc<Mutex<GraphIndex>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,12 +89,24 @@ struct GraphQuery {
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
+    body: Json<ApiErrorBody>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiErrorBody {
+    error: ApiErrorPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiErrorPayload {
     message: String,
+    line: Option<usize>,
+    column: Option<usize>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, self.message).into_response()
+        (self.status, self.body).into_response()
     }
 }
 
@@ -94,7 +116,13 @@ async fn graph_handler(
 ) -> Result<Json<GraphData>, ApiError> {
     let Query(query) = query.map_err(|error| ApiError {
         status: StatusCode::BAD_REQUEST,
-        message: error.body_text(),
+        body: Json(ApiErrorBody {
+            error: ApiErrorPayload {
+                message: error.body_text(),
+                line: None,
+                column: None,
+            },
+        }),
     })?;
     let node_repo = NodeRepo::new(state.pool.clone());
     let rel_repo = RelRepo::new(state.pool);
@@ -116,16 +144,59 @@ async fn graph_handler(
 fn internal_error(error: sqlx::Error) -> ApiError {
     ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: error.to_string(),
+        body: Json(ApiErrorBody {
+            error: ApiErrorPayload {
+                message: error.to_string(),
+                line: None,
+                column: None,
+            },
+        }),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryRequest {
+    query: String,
+}
+
+async fn query_handler(
+    State(state): State<AppState>,
+    Json(request): Json<QueryRequest>,
+) -> Result<Json<crate::domain::QueryResult>, ApiError> {
+    let parsed = parse(&request.query).map_err(|error| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        body: Json(ApiErrorBody {
+            error: ApiErrorPayload {
+                message: error.message,
+                line: Some(error.line),
+                column: Some(error.column),
+            },
+        }),
+    })?;
+    let mut graph_index = state.graph_index.lock().await;
+
+    execute_query(&state.pool, &mut graph_index, &parsed)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            body: Json(ApiErrorBody {
+                error: ApiErrorPayload {
+                    message: error.message,
+                    line: None,
+                    column: None,
+                },
+            }),
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{app, app_with_pool, crate_name};
+    use super::{app, app_with_state, crate_name};
     use crate::{
         db::{create_pool, NodeRepo, RelRepo},
         domain::Properties,
+        graph::GraphIndex,
     };
     use axum::body::{to_bytes, Body};
     use http::{Request, StatusCode};
@@ -206,7 +277,10 @@ mod tests {
             .await
             .expect("publishes_to insert should succeed");
 
-        let response = app_with_pool(pool.clone())
+        let graph_index = GraphIndex::load_from_db(&pool)
+            .await
+            .expect("graph index should load");
+        let response = app_with_state(pool.clone(), graph_index)
             .oneshot(
                 Request::builder()
                     .uri("/api/graph")
@@ -231,7 +305,10 @@ mod tests {
         );
         assert_eq!(payload["relationships"][0]["id"], json!(depends_on.id));
 
-        let limited_response = app_with_pool(pool)
+        let graph_index = GraphIndex::load_from_db(&pool)
+            .await
+            .expect("graph index should load");
+        let limited_response = app_with_state(pool, graph_index)
             .oneshot(
                 Request::builder()
                     .uri("/api/graph?limit=1")
@@ -262,7 +339,7 @@ mod tests {
             return;
         };
 
-        let response = app_with_pool(pool)
+        let response = app_with_state(pool, GraphIndex::new())
             .oneshot(
                 Request::builder()
                     .uri("/api/graph?limit=abc")
@@ -273,6 +350,126 @@ mod tests {
             .expect("router should respond");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn query_endpoint_executes_match_and_returns_query_result() {
+        let _guard = DB_TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        ensure_schema(&pool).await;
+        reset_tables(&pool).await;
+
+        let node_repo = NodeRepo::new(pool.clone());
+        let rel_repo = RelRepo::new(pool.clone());
+
+        let service = node_repo
+            .insert(vec!["Service".to_string()], Properties::new())
+            .await
+            .expect("service insert should succeed");
+        let database = node_repo
+            .insert(vec!["Database".to_string()], Properties::new())
+            .await
+            .expect("database insert should succeed");
+        rel_repo
+            .insert(
+                "DEPENDS_ON".to_string(),
+                service.id,
+                database.id,
+                Properties::new(),
+            )
+            .await
+            .expect("relationship insert should succeed");
+
+        let graph_index = GraphIndex::load_from_db(&pool)
+            .await
+            .expect("graph index should load");
+        let response = app_with_state(pool, graph_index)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":"MATCH (service:Service)-[rel:DEPENDS_ON]->(database:Database) RETURN service, rel, database"}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: Value = serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["columns"], json!(["service", "rel", "database"]));
+        assert_eq!(payload["rows"].as_array().expect("rows should be array").len(), 1);
+        assert_eq!(payload["nodes"].as_array().expect("nodes should be array").len(), 2);
+        assert_eq!(
+            payload["relationships"]
+                .as_array()
+                .expect("relationships should be array")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn query_endpoint_returns_structured_parse_errors() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let response = app_with_state(pool, GraphIndex::new())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"MATCH (n {name: }) RETURN n"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: Value = serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["error"]["message"], json!("expected a literal value"));
+        assert_eq!(payload["error"]["line"], json!(1));
+        assert_eq!(payload["error"]["column"], json!(18));
+    }
+
+    #[tokio::test]
+    async fn query_endpoint_returns_structured_execution_errors() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let response = app_with_state(pool, GraphIndex::new())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"MATCH (n) RETURN missing"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let payload: Value = serde_json::from_slice(&body).expect("payload should deserialize");
+        assert_eq!(payload["error"]["message"], json!("unbound identifier 'missing'"));
+        assert!(payload["error"]["line"].is_null());
+        assert!(payload["error"]["column"].is_null());
     }
 
     async fn test_pool() -> Option<sqlx::PgPool> {

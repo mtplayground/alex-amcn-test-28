@@ -123,11 +123,66 @@ pub async fn execute_create(
     })
 }
 
+pub async fn execute_query(
+    pool: &PgPool,
+    graph_index: &mut GraphIndex,
+    query: &Query,
+) -> Result<QueryResult, ExecutorError> {
+    let create_clause = extract_optional_clause(query, |clause| match clause {
+        Clause::Create(clause) => Some(clause),
+        _ => None,
+    })?;
+    let delete_clause = extract_optional_clause(query, |clause| match clause {
+        Clause::Delete(clause) => Some(clause),
+        _ => None,
+    })?;
+    let has_match = query.clauses.iter().any(|clause| matches!(clause, Clause::Match(_)));
+    let has_return = query
+        .clauses
+        .iter()
+        .any(|clause| matches!(clause, Clause::Return(_)));
+
+    let mut delete_bindings = Vec::new();
+
+    if let Some(create_clause) = create_clause {
+        let create_summary = execute_create(pool, graph_index, create_clause).await?;
+        delete_bindings.push(create_summary.bindings);
+    }
+
+    let result = if has_match || has_return {
+        let (result, bindings) = execute_match_query_with_bindings(pool, graph_index, query).await?;
+        delete_bindings = bindings;
+        result
+    } else {
+        QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            nodes: Vec::new(),
+            relationships: Vec::new(),
+        }
+    };
+
+    if let Some(delete_clause) = delete_clause {
+        execute_delete(pool, graph_index, &delete_bindings, delete_clause).await?;
+    }
+
+    Ok(result)
+}
+
 pub async fn execute_match_query(
     pool: &PgPool,
     graph_index: &GraphIndex,
     query: &Query,
 ) -> Result<QueryResult, ExecutorError> {
+    let (result, _) = execute_match_query_with_bindings(pool, graph_index, query).await?;
+    Ok(result)
+}
+
+async fn execute_match_query_with_bindings(
+    pool: &PgPool,
+    graph_index: &GraphIndex,
+    query: &Query,
+) -> Result<(QueryResult, Vec<Binding>), ExecutorError> {
     let node_repo = NodeRepo::new(pool.clone());
     let rel_repo = RelRepo::new(pool.clone());
     let nodes = node_repo.list().await?;
@@ -185,7 +240,8 @@ pub async fn execute_match_query(
         bindings.truncate(limit_clause.count);
     }
 
-    build_query_result(return_clause, &bindings, &node_map)
+    let result = build_query_result(return_clause, &bindings, &node_map)?;
+    Ok((result, bindings))
 }
 
 pub async fn execute_delete(
