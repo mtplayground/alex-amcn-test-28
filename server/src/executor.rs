@@ -8,7 +8,10 @@ use crate::{
     db::{NodeRepo, RelRepo},
     domain::{Node, NodeId, Properties, RelId, Relationship},
     graph::GraphIndex,
-    parser::{CreateClause, DeleteClause, Expression, Literal, NodePattern, RelationshipPattern},
+    parser::{
+        BinaryOperator, Clause, CreateClause, DeleteClause, Expression, Literal, NodePattern,
+        Query, RelationshipPattern,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +27,13 @@ pub struct CreateSummary {
     pub bindings: Binding,
     pub created_nodes: Vec<Node>,
     pub created_relationships: Vec<Relationship>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchSummary {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<JsonValue>>,
+    pub bindings: Vec<Binding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +130,91 @@ pub async fn execute_create(
     })
 }
 
+pub async fn execute_match_query(
+    pool: &PgPool,
+    graph_index: &GraphIndex,
+    query: &Query,
+) -> Result<MatchSummary, ExecutorError> {
+    let node_repo = NodeRepo::new(pool.clone());
+    let rel_repo = RelRepo::new(pool.clone());
+    let nodes = node_repo.list().await?;
+    let relationships = rel_repo.list().await?;
+    let node_map = nodes
+        .into_iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    let relationship_map = relationships
+        .into_iter()
+        .map(|relationship| (relationship.id, relationship))
+        .collect::<HashMap<_, _>>();
+
+    let match_clause = extract_single_clause(query, |clause| match clause {
+        Clause::Match(clause) => Some(clause),
+        _ => None,
+    })?;
+    let where_clause = extract_optional_clause(query, |clause| match clause {
+        Clause::Where(clause) => Some(clause),
+        _ => None,
+    })?;
+    let return_clause = extract_single_clause(query, |clause| match clause {
+        Clause::Return(clause) => Some(clause),
+        _ => None,
+    })?;
+    let limit_clause = extract_optional_clause(query, |clause| match clause {
+        Clause::Limit(clause) => Some(clause),
+        _ => None,
+    })?;
+
+    let mut bindings = vec![Binding::new()];
+    for pattern in &match_clause.patterns {
+        let mut next_bindings = Vec::new();
+        for binding in &bindings {
+            extend_pattern_matches(
+                pattern,
+                binding,
+                graph_index,
+                &node_map,
+                &relationship_map,
+                &mut next_bindings,
+            )?;
+        }
+        bindings = next_bindings;
+    }
+
+    if let Some(where_clause) = where_clause {
+        bindings = bindings
+            .into_iter()
+            .filter(|binding| evaluate_predicate(&where_clause.expression, binding).unwrap_or(false))
+            .collect();
+    }
+
+    if let Some(limit_clause) = limit_clause {
+        bindings.truncate(limit_clause.count);
+    }
+
+    let columns = return_clause
+        .items
+        .iter()
+        .map(|projection| projection_name(&projection.expression))
+        .collect::<Vec<_>>();
+    let rows = bindings
+        .iter()
+        .map(|binding| {
+            return_clause
+                .items
+                .iter()
+                .map(|projection| project_value(&projection.expression, binding))
+                .collect::<Result<Vec<_>, ExecutorError>>()
+        })
+        .collect::<Result<Vec<_>, ExecutorError>>()?;
+
+    Ok(MatchSummary {
+        columns,
+        rows,
+        bindings,
+    })
+}
+
 pub async fn execute_delete(
     pool: &PgPool,
     graph_index: &mut GraphIndex,
@@ -176,6 +271,375 @@ pub async fn execute_delete(
     }
 
     Ok(deletion_plan)
+}
+
+fn extend_pattern_matches(
+    pattern: &crate::parser::Pattern,
+    binding: &Binding,
+    graph_index: &GraphIndex,
+    nodes: &HashMap<NodeId, Node>,
+    relationships: &HashMap<RelId, Relationship>,
+    results: &mut Vec<Binding>,
+) -> Result<(), ExecutorError> {
+    for start_node in candidate_nodes(&pattern.start, binding, nodes)? {
+        let Some(bound_start) = bind_node_pattern(binding, &pattern.start, start_node)? else {
+            continue;
+        };
+
+        walk_pattern_chain(
+            &pattern.chains,
+            0,
+            bound_start,
+            start_node,
+            graph_index,
+            nodes,
+            relationships,
+            results,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn walk_pattern_chain(
+    chains: &[crate::parser::PatternChain],
+    index: usize,
+    binding: Binding,
+    current_node: &Node,
+    graph_index: &GraphIndex,
+    nodes: &HashMap<NodeId, Node>,
+    relationships: &HashMap<RelId, Relationship>,
+    results: &mut Vec<Binding>,
+) -> Result<(), ExecutorError> {
+    if index == chains.len() {
+        results.push(binding);
+        return Ok(());
+    }
+
+    let chain = &chains[index];
+    for rel_id in graph_index.outgoing_rel_ids(current_node.id) {
+        let Some(relationship) = relationships.get(&rel_id) else {
+            continue;
+        };
+        if relationship.start_id != current_node.id {
+            continue;
+        }
+
+        let Some(bound_rel) = bind_relationship_pattern(&binding, &chain.relationship, relationship)?
+        else {
+            continue;
+        };
+        let Some(next_node) = nodes.get(&relationship.end_id) else {
+            continue;
+        };
+        let Some(bound_node) = bind_node_pattern(&bound_rel, &chain.node, next_node)? else {
+            continue;
+        };
+
+        walk_pattern_chain(
+            chains,
+            index + 1,
+            bound_node,
+            next_node,
+            graph_index,
+            nodes,
+            relationships,
+            results,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn candidate_nodes<'a>(
+    pattern: &NodePattern,
+    binding: &'a Binding,
+    nodes: &'a HashMap<NodeId, Node>,
+) -> Result<Vec<&'a Node>, ExecutorError> {
+    if let Some(variable) = &pattern.variable {
+        if let Some(bound_value) = binding.get(variable) {
+            return match bound_value {
+                BoundValue::Node(node) => Ok(nodes.get(&node.id).into_iter().collect()),
+                BoundValue::Relationship(_) => Err(ExecutorError {
+                    message: format!("variable '{}' is already bound to a relationship", variable),
+                }),
+            };
+        }
+    }
+
+    let mut candidates = nodes.values().collect::<Vec<_>>();
+    candidates.sort_by_key(|node| node.id);
+    Ok(candidates)
+}
+
+fn bind_node_pattern(
+    binding: &Binding,
+    pattern: &NodePattern,
+    candidate: &Node,
+) -> Result<Option<Binding>, ExecutorError> {
+    if !node_matches_pattern(candidate, pattern) {
+        return Ok(None);
+    }
+
+    let mut next = binding.clone();
+    if let Some(variable) = &pattern.variable {
+        match binding.get(variable) {
+            Some(BoundValue::Node(node)) if node.id == candidate.id => {}
+            Some(BoundValue::Node(_)) => return Ok(None),
+            Some(BoundValue::Relationship(_)) => {
+                return Err(ExecutorError {
+                    message: format!("variable '{}' is already bound to a relationship", variable),
+                });
+            }
+            None => {
+                next.insert(variable.clone(), BoundValue::Node(candidate.clone()));
+            }
+        }
+    }
+
+    Ok(Some(next))
+}
+
+fn bind_relationship_pattern(
+    binding: &Binding,
+    pattern: &RelationshipPattern,
+    candidate: &Relationship,
+) -> Result<Option<Binding>, ExecutorError> {
+    if !relationship_matches_pattern(candidate, pattern) {
+        return Ok(None);
+    }
+
+    let mut next = binding.clone();
+    if let Some(variable) = &pattern.variable {
+        match binding.get(variable) {
+            Some(BoundValue::Relationship(relationship)) if relationship.id == candidate.id => {}
+            Some(BoundValue::Relationship(_)) => return Ok(None),
+            Some(BoundValue::Node(_)) => {
+                return Err(ExecutorError {
+                    message: format!("variable '{}' is already bound to a node", variable),
+                });
+            }
+            None => {
+                next.insert(variable.clone(), BoundValue::Relationship(candidate.clone()));
+            }
+        }
+    }
+
+    Ok(Some(next))
+}
+
+fn node_matches_pattern(node: &Node, pattern: &NodePattern) -> bool {
+    pattern
+        .labels
+        .iter()
+        .all(|label| node.labels.iter().any(|node_label| node_label == label))
+        && properties_match(&node.properties, &pattern.properties)
+}
+
+fn relationship_matches_pattern(
+    relationship: &Relationship,
+    pattern: &RelationshipPattern,
+) -> bool {
+    pattern
+        .rel_type
+        .as_ref()
+        .is_none_or(|rel_type| rel_type == &relationship.r#type)
+        && properties_match(&relationship.properties, &pattern.properties)
+}
+
+fn properties_match(
+    actual: &Properties,
+    expected: &[crate::parser::Property],
+) -> bool {
+    let expected = properties_from_literals(expected);
+    expected
+        .iter()
+        .all(|(key, value)| actual.get(key).is_some_and(|actual| actual == value))
+}
+
+fn evaluate_predicate(expression: &Expression, binding: &Binding) -> Result<bool, ExecutorError> {
+    match expression {
+        Expression::Binary {
+            left,
+            operator: BinaryOperator::And,
+            right,
+        } => Ok(evaluate_predicate(left, binding)? && evaluate_predicate(right, binding)?),
+        Expression::Binary {
+            left,
+            operator: BinaryOperator::Or,
+            right,
+        } => Ok(evaluate_predicate(left, binding)? || evaluate_predicate(right, binding)?),
+        Expression::Binary {
+            left,
+            operator,
+            right,
+        } => compare_values(
+            &scalar_value(left, binding)?,
+            operator,
+            &scalar_value(right, binding)?,
+        ),
+        _ => match scalar_value(expression, binding)? {
+            JsonValue::Bool(value) => Ok(value),
+            _ => Err(ExecutorError {
+                message: "WHERE expressions must evaluate to booleans".to_string(),
+            }),
+        },
+    }
+}
+
+fn scalar_value(expression: &Expression, binding: &Binding) -> Result<JsonValue, ExecutorError> {
+    match expression {
+        Expression::Literal(literal) => Ok(literal_to_json(literal)),
+        Expression::PropertyAccess {
+            identifier,
+            property,
+        } => {
+            let bound = binding.get(identifier).ok_or_else(|| ExecutorError {
+                message: format!("unbound identifier '{}'", identifier),
+            })?;
+            Ok(match bound {
+                BoundValue::Node(node) => node.properties.get(property).cloned().unwrap_or(JsonValue::Null),
+                BoundValue::Relationship(relationship) => relationship
+                    .properties
+                    .get(property)
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+            })
+        }
+        Expression::Identifier(identifier) => {
+            let bound = binding.get(identifier).ok_or_else(|| ExecutorError {
+                message: format!("unbound identifier '{}'", identifier),
+            })?;
+            match bound {
+                BoundValue::Node(_) | BoundValue::Relationship(_) => Err(ExecutorError {
+                    message: format!(
+                        "identifier '{}' does not resolve to a scalar value in this expression",
+                        identifier
+                    ),
+                }),
+            }
+        }
+        Expression::Binary { .. } => Ok(JsonValue::Bool(evaluate_predicate(expression, binding)?)),
+    }
+}
+
+fn compare_values(
+    left: &JsonValue,
+    operator: &BinaryOperator,
+    right: &JsonValue,
+) -> Result<bool, ExecutorError> {
+    use std::cmp::Ordering;
+
+    let ordering = match (left, right) {
+        (JsonValue::Number(left), JsonValue::Number(right)) => {
+            left.as_f64()
+                .zip(right.as_f64())
+                .and_then(|(left, right)| left.partial_cmp(&right))
+        }
+        (JsonValue::String(left), JsonValue::String(right)) => Some(left.cmp(right)),
+        (JsonValue::Bool(left), JsonValue::Bool(right)) => Some(left.cmp(right)),
+        (JsonValue::Null, JsonValue::Null) => Some(Ordering::Equal),
+        _ => None,
+    };
+
+    Ok(match operator {
+        BinaryOperator::Equals => left == right,
+        BinaryOperator::NotEquals => left != right,
+        BinaryOperator::LessThan => ordering.is_some_and(|ordering| ordering == Ordering::Less),
+        BinaryOperator::LessThanOrEqual => ordering.is_some_and(|ordering| {
+            ordering == Ordering::Less || ordering == Ordering::Equal
+        }),
+        BinaryOperator::GreaterThan => {
+            ordering.is_some_and(|ordering| ordering == Ordering::Greater)
+        }
+        BinaryOperator::GreaterThanOrEqual => ordering.is_some_and(|ordering| {
+            ordering == Ordering::Greater || ordering == Ordering::Equal
+        }),
+        BinaryOperator::And | BinaryOperator::Or => {
+            return Err(ExecutorError {
+                message: "logical operators require boolean expressions".to_string(),
+            });
+        }
+    })
+}
+
+fn project_value(expression: &Expression, binding: &Binding) -> Result<JsonValue, ExecutorError> {
+    match expression {
+        Expression::Identifier(identifier) => {
+            let bound = binding.get(identifier).ok_or_else(|| ExecutorError {
+                message: format!("unbound identifier '{}'", identifier),
+            })?;
+            match bound {
+                BoundValue::Node(node) => serde_json::to_value(node).map_err(|error| ExecutorError {
+                    message: error.to_string(),
+                }),
+                BoundValue::Relationship(relationship) => {
+                    serde_json::to_value(relationship).map_err(|error| ExecutorError {
+                        message: error.to_string(),
+                    })
+                }
+            }
+        }
+        Expression::PropertyAccess { .. } | Expression::Literal(_) | Expression::Binary { .. } => {
+            scalar_value(expression, binding)
+        }
+    }
+}
+
+fn projection_name(expression: &Expression) -> String {
+    match expression {
+        Expression::Identifier(identifier) => identifier.clone(),
+        Expression::PropertyAccess {
+            identifier,
+            property,
+        } => format!("{identifier}.{property}"),
+        Expression::Literal(literal) => match literal {
+            Literal::String(value) => value.clone(),
+            Literal::Number(value) => value.clone(),
+            Literal::Bool(value) => value.to_string(),
+        },
+        Expression::Binary { .. } => "expr".to_string(),
+    }
+}
+
+fn literal_to_json(literal: &Literal) -> JsonValue {
+    match literal {
+        Literal::String(value) => JsonValue::String(value.clone()),
+        Literal::Number(value) => json_number_from_lexer(value),
+        Literal::Bool(value) => JsonValue::Bool(*value),
+    }
+}
+
+fn extract_single_clause<'a, T>(
+    query: &'a Query,
+    selector: impl Fn(&'a Clause) -> Option<&'a T>,
+) -> Result<&'a T, ExecutorError> {
+    let mut matches = query.clauses.iter().filter_map(selector);
+    let Some(first) = matches.next() else {
+        return Err(ExecutorError {
+            message: "query is missing a required clause".to_string(),
+        });
+    };
+    if matches.next().is_some() {
+        return Err(ExecutorError {
+            message: "query contains multiple unsupported clauses of the same kind".to_string(),
+        });
+    }
+    Ok(first)
+}
+
+fn extract_optional_clause<'a, T>(
+    query: &'a Query,
+    selector: impl Fn(&'a Clause) -> Option<&'a T>,
+) -> Result<Option<&'a T>, ExecutorError> {
+    let mut matches = query.clauses.iter().filter_map(selector);
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(ExecutorError {
+            message: "query contains multiple unsupported clauses of the same kind".to_string(),
+        });
+    }
+    Ok(first)
 }
 
 async fn materialize_node_pattern(
@@ -351,7 +815,7 @@ fn json_number_from_lexer(value: &str) -> JsonValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_create, execute_delete, Binding, BoundValue};
+    use super::{execute_create, execute_delete, execute_match_query, Binding, BoundValue};
     use crate::{
         db::{create_pool, NodeRepo, RelRepo},
         domain::Properties,
@@ -364,6 +828,197 @@ mod tests {
     use tokio::sync::Mutex;
 
     static DB_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[tokio::test]
+    async fn match_where_return_and_limit_project_rows_from_traversal() {
+        let _guard = DB_TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        ensure_schema(&pool).await;
+        reset_tables(&pool).await;
+
+        let node_repo = NodeRepo::new(pool.clone());
+        let rel_repo = RelRepo::new(pool.clone());
+
+        let api = insert_named_node(&node_repo, "Service", "api").await;
+        let worker = insert_named_node(&node_repo, "Service", "worker").await;
+        let primary = insert_named_node(&node_repo, "Database", "primary").await;
+        let replica = insert_named_node(&node_repo, "Database", "replica").await;
+
+        rel_repo
+            .insert(
+                "DEPENDS_ON".to_string(),
+                api.id,
+                primary.id,
+                properties([("weight", JsonValue::Number(serde_json::Number::from(5)))]),
+            )
+            .await
+            .expect("first relationship insert should succeed");
+        rel_repo
+            .insert(
+                "DEPENDS_ON".to_string(),
+                worker.id,
+                replica.id,
+                properties([("weight", JsonValue::Number(serde_json::Number::from(1)))]),
+            )
+            .await
+            .expect("second relationship insert should succeed");
+
+        let graph_index = GraphIndex::load_from_db(&pool)
+            .await
+            .expect("graph index should load");
+        let query = parse(
+            "MATCH (service:Service)-[rel:DEPENDS_ON]->(database:Database) \
+             WHERE rel.weight >= 3 \
+             RETURN service.name, database.name \
+             LIMIT 1",
+        )
+        .expect("query should parse");
+
+        let summary = execute_match_query(&pool, &graph_index, &query)
+            .await
+            .expect("match query should succeed");
+
+        assert_eq!(
+            summary.columns,
+            vec!["service.name".to_string(), "database.name".to_string()]
+        );
+        assert_eq!(
+            summary.rows,
+            vec![vec![
+                JsonValue::String("api".to_string()),
+                JsonValue::String("primary".to_string())
+            ]]
+        );
+        assert_eq!(summary.bindings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn match_joins_multiple_patterns_through_shared_variables() {
+        let _guard = DB_TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        ensure_schema(&pool).await;
+        reset_tables(&pool).await;
+
+        let node_repo = NodeRepo::new(pool.clone());
+        let rel_repo = RelRepo::new(pool.clone());
+
+        let api = insert_named_node(&node_repo, "Service", "api").await;
+        let worker = insert_named_node(&node_repo, "Service", "worker").await;
+        let primary = insert_named_node(&node_repo, "Database", "primary").await;
+        let fast_cache = insert_named_node(&node_repo, "Cache", "fast").await;
+        let cold_cache = insert_named_node(&node_repo, "Cache", "cold").await;
+
+        rel_repo
+            .insert(
+                "DEPENDS_ON".to_string(),
+                api.id,
+                primary.id,
+                Properties::new(),
+            )
+            .await
+            .expect("depends relationship insert should succeed");
+        rel_repo
+            .insert(
+                "USES".to_string(),
+                api.id,
+                fast_cache.id,
+                Properties::new(),
+            )
+            .await
+            .expect("uses relationship insert should succeed");
+        rel_repo
+            .insert(
+                "USES".to_string(),
+                worker.id,
+                cold_cache.id,
+                Properties::new(),
+            )
+            .await
+            .expect("worker uses relationship insert should succeed");
+
+        let graph_index = GraphIndex::load_from_db(&pool)
+            .await
+            .expect("graph index should load");
+        let query = parse(
+            "MATCH (service:Service)-[:DEPENDS_ON]->(database:Database), \
+             (service)-[:USES]->(cache:Cache) \
+             RETURN service.name, cache.name",
+        )
+        .expect("query should parse");
+
+        let summary = execute_match_query(&pool, &graph_index, &query)
+            .await
+            .expect("match query should succeed");
+
+        assert_eq!(summary.rows.len(), 1);
+        assert_eq!(
+            summary.rows[0],
+            vec![
+                JsonValue::String("api".to_string()),
+                JsonValue::String("fast".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn match_returns_bound_entities_and_filters_with_parenthesized_where() {
+        let _guard = DB_TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        ensure_schema(&pool).await;
+        reset_tables(&pool).await;
+
+        let node_repo = NodeRepo::new(pool.clone());
+        let rel_repo = RelRepo::new(pool.clone());
+
+        let api = insert_named_node(&node_repo, "Service", "api").await;
+        let primary = insert_named_node(&node_repo, "Database", "primary").await;
+        let archive = insert_named_node(&node_repo, "Database", "archive").await;
+
+        rel_repo
+            .insert(
+                "DEPENDS_ON".to_string(),
+                api.id,
+                primary.id,
+                properties([("weight", JsonValue::Number(serde_json::Number::from(5)))]),
+            )
+            .await
+            .expect("first relationship insert should succeed");
+        rel_repo
+            .insert(
+                "DEPENDS_ON".to_string(),
+                api.id,
+                archive.id,
+                properties([("weight", JsonValue::Number(serde_json::Number::from(2)))]),
+            )
+            .await
+            .expect("second relationship insert should succeed");
+
+        let graph_index = GraphIndex::load_from_db(&pool)
+            .await
+            .expect("graph index should load");
+        let query = parse(
+            "MATCH (service:Service)-[rel:DEPENDS_ON]->(database:Database) \
+             WHERE (rel.weight > 4 OR database.name = 'archive') AND service.name = 'api' \
+             RETURN service, rel, database.name",
+        )
+        .expect("query should parse");
+
+        let summary = execute_match_query(&pool, &graph_index, &query)
+            .await
+            .expect("match query should succeed");
+
+        assert_eq!(summary.rows.len(), 2);
+        assert!(summary.rows.iter().any(|row| row[2] == JsonValue::String("primary".to_string())));
+        assert!(summary.rows.iter().any(|row| row[2] == JsonValue::String("archive".to_string())));
+        assert!(summary.rows.iter().all(|row| row[0].get("id").is_some()));
+        assert!(summary.rows.iter().all(|row| row[1].get("type").is_some()));
+    }
 
     #[tokio::test]
     async fn create_persists_nodes_relationships_and_bindings() {
@@ -682,6 +1337,22 @@ mod tests {
     }
 
     fn binding<const N: usize>(entries: [(&str, BoundValue); N]) -> Binding {
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect()
+    }
+
+    async fn insert_named_node(repo: &NodeRepo, label: &str, name: &str) -> crate::domain::Node {
+        repo.insert(
+            vec![label.to_string()],
+            properties([("name", JsonValue::String(name.to_string()))]),
+        )
+        .await
+        .expect("node insert should succeed")
+    }
+
+    fn properties<const N: usize>(entries: [(&str, JsonValue); N]) -> Properties {
         entries
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))
