@@ -145,6 +145,21 @@ impl RelRepo {
         relationship_from_row(&row)
     }
 
+    pub async fn get(&self, id: i64) -> Result<Option<Relationship>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, type, start_id, end_id, properties
+            FROM relationships
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| relationship_from_row(&row)).transpose()
+    }
+
     pub async fn list_by_type(&self, rel_type: &str) -> Result<Vec<Relationship>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
@@ -173,6 +188,20 @@ impl RelRepo {
         .await?;
 
         rows.iter().map(relationship_from_row).collect()
+    }
+
+    pub async fn delete(&self, id: i64) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM relationships
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn delete_by_node(&self, node_id: i64) -> Result<u64, sqlx::Error> {
@@ -291,7 +320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relationship_repo_supports_insert_list_and_delete_by_node() {
+    async fn relationship_repo_supports_insert_get_list_delete_and_delete_by_node() {
         let _guard = DB_TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await;
         let Some(pool) = test_pool().await else {
             return;
@@ -336,20 +365,39 @@ mod tests {
             .await
             .expect("second relationship insert should succeed");
 
+        let fetched = rel_repo
+            .get(inserted.id)
+            .await
+            .expect("relationship get should succeed")
+            .expect("relationship should exist");
+        assert_eq!(fetched, inserted);
+
         let listed = rel_repo
-            .list_by_type("DEPENDS_ON")
+            .list()
             .await
             .expect("relationship list should succeed");
-        assert_eq!(listed, vec![inserted]);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0], inserted);
 
         let deleted = rel_repo
+            .delete(inserted.id)
+            .await
+            .expect("relationship delete should succeed");
+        assert!(deleted);
+        assert!(rel_repo
+            .get(inserted.id)
+            .await
+            .expect("relationship get after delete should succeed")
+            .is_none());
+
+        let deleted_by_node = rel_repo
             .delete_by_node(end.id)
             .await
             .expect("relationship delete by node should succeed");
-        assert_eq!(deleted, 2);
+        assert_eq!(deleted_by_node, 1);
 
         let after_delete = rel_repo
-            .list_by_type("DEPENDS_ON")
+            .list()
             .await
             .expect("relationship list after delete should succeed");
         assert!(after_delete.is_empty());
