@@ -215,6 +215,76 @@ mod tests {
         assert!(index.contains_rel(relationship.id));
     }
 
+    #[tokio::test]
+    async fn graph_index_stays_in_sync_after_each_repo_mutation() {
+        let _guard = DB_TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        ensure_schema(&pool).await;
+        reset_tables(&pool).await;
+
+        let node_repo = NodeRepo::new(pool.clone());
+        let rel_repo = RelRepo::new(pool.clone());
+        let mut index = GraphIndex::load_from_db(&pool)
+            .await
+            .expect("graph load should succeed");
+
+        assert_eq!(index.node_count(), 0);
+        assert_eq!(index.relationship_count(), 0);
+
+        let alpha = node_repo
+            .insert(vec!["Service".to_string()], Properties::new())
+            .await
+            .expect("alpha node insert should succeed");
+        index.add_node(alpha.id);
+        assert_eq!(index.node_count(), 1);
+        assert!(index.contains_node(alpha.id));
+
+        let beta = node_repo
+            .insert(vec!["Database".to_string()], Properties::new())
+            .await
+            .expect("beta node insert should succeed");
+        index.add_node(beta.id);
+        assert_eq!(index.node_count(), 2);
+        assert!(index.contains_node(beta.id));
+
+        let relationship = rel_repo
+            .insert("DEPENDS_ON".to_string(), alpha.id, beta.id, Properties::new())
+            .await
+            .expect("relationship insert should succeed");
+        index.add_rel(relationship.id, relationship.start_id, relationship.end_id);
+        assert_eq!(index.relationship_count(), 1);
+        assert!(index.contains_rel(relationship.id));
+
+        let rel_deleted = rel_repo
+            .delete(relationship.id)
+            .await
+            .expect("relationship delete should succeed");
+        assert!(rel_deleted);
+        assert!(index.remove_rel(relationship.id));
+        assert_eq!(index.relationship_count(), 0);
+        assert!(!index.contains_rel(relationship.id));
+
+        let beta_deleted = node_repo
+            .delete(beta.id)
+            .await
+            .expect("beta node delete should succeed");
+        assert!(beta_deleted);
+        assert!(index.remove_node(beta.id));
+        assert_eq!(index.node_count(), 1);
+        assert!(!index.contains_node(beta.id));
+
+        let alpha_deleted = node_repo
+            .delete(alpha.id)
+            .await
+            .expect("alpha node delete should succeed");
+        assert!(alpha_deleted);
+        assert!(index.remove_node(alpha.id));
+        assert_eq!(index.node_count(), 0);
+        assert!(!index.contains_node(alpha.id));
+    }
+
     async fn test_pool() -> Option<sqlx::PgPool> {
         let database_url = std::env::var("ZEROCLAW_TEST_DATABASE_URL")
             .unwrap_or_else(|_| include_str!("../../.database_url").trim().to_string());
