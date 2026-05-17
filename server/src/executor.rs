@@ -1396,6 +1396,82 @@ mod tests {
         assert!(graph_index.contains_rel(relationship.id));
     }
 
+    #[tokio::test]
+    async fn create_match_and_delete_run_end_to_end_against_database() {
+        let _guard = DB_TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        ensure_schema(&pool).await;
+        reset_tables(&pool).await;
+
+        let node_repo = NodeRepo::new(pool.clone());
+        let rel_repo = RelRepo::new(pool.clone());
+        let mut graph_index = GraphIndex::new();
+
+        let create = parse(
+            "CREATE (service:Service {name: 'api'})-[rel:DEPENDS_ON {weight: 3}]->(database:Database {name: 'primary'})",
+        )
+        .expect("create query should parse");
+        let create_summary = execute_create(&pool, &mut graph_index, &create_clause(&create))
+            .await
+            .expect("create should succeed");
+
+        assert_eq!(node_repo.list().await.expect("node list should succeed").len(), 2);
+        assert_eq!(
+            rel_repo
+                .list()
+                .await
+                .expect("relationship list should succeed")
+                .len(),
+            1
+        );
+
+        let match_query = parse(
+            "MATCH (service:Service)-[rel:DEPENDS_ON]->(database:Database) \
+             WHERE service.name = 'api' \
+             RETURN service, rel, database.name",
+        )
+        .expect("match query should parse");
+        let match_result = execute_match_query(&pool, &graph_index, &match_query)
+            .await
+            .expect("match should succeed");
+
+        assert_eq!(
+            match_result.columns,
+            vec![
+                "service".to_string(),
+                "rel".to_string(),
+                "database.name".to_string()
+            ]
+        );
+        assert_eq!(match_result.rows.len(), 1);
+        assert_eq!(match_result.nodes.len(), 2);
+        assert_eq!(match_result.relationships.len(), 1);
+        assert_eq!(match_result.rows[0][2], JsonValue::String("primary".to_string()));
+
+        let delete = parse("DETACH DELETE service").expect("delete query should parse");
+        let delete_summary = execute_delete(
+            &pool,
+            &mut graph_index,
+            &[create_summary.bindings.clone()],
+            &delete_clause(&delete),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(delete_summary.deleted_nodes.len(), 1);
+        assert_eq!(delete_summary.deleted_relationships.len(), 1);
+        assert_eq!(node_repo.list().await.expect("node list should succeed").len(), 1);
+        assert!(rel_repo
+            .list()
+            .await
+            .expect("relationship list should succeed")
+            .is_empty());
+        assert_eq!(graph_index.node_count(), 1);
+        assert_eq!(graph_index.relationship_count(), 0);
+    }
+
     fn delete_clause(parsed: &crate::parser::Query) -> crate::parser::DeleteClause {
         match &parsed.clauses[0] {
             Clause::Delete(clause) => clause.clone(),

@@ -780,4 +780,87 @@ mod tests {
 
         assert_eq!(error.message, "LIMIT must be a non-negative integer");
     }
+
+    #[test]
+    fn parses_supported_literals_labels_and_multi_expression_delete() {
+        let query = parse(
+            "CREATE (:Service:Critical {name: 'api', score: 9.5, active: true})-[r:DEPENDS_ON {weight: 3}]->(:Database) DELETE r, true",
+        )
+        .expect("query should parse");
+
+        assert_eq!(query.clauses.len(), 2);
+        assert_eq!(
+            query.clauses[0],
+            Clause::Create(super::CreateClause {
+                patterns: vec![Pattern {
+                    start: NodePattern {
+                        variable: None,
+                        labels: vec!["Service".to_string(), "Critical".to_string()],
+                        properties: vec![
+                            Property {
+                                key: "name".to_string(),
+                                value: Literal::String("api".to_string()),
+                            },
+                            Property {
+                                key: "score".to_string(),
+                                value: Literal::Number("9.5".to_string()),
+                            },
+                            Property {
+                                key: "active".to_string(),
+                                value: Literal::Bool(true),
+                            },
+                        ],
+                    },
+                    chains: vec![PatternChain {
+                        relationship: RelationshipPattern {
+                            variable: Some("r".to_string()),
+                            rel_type: Some("DEPENDS_ON".to_string()),
+                            properties: vec![Property {
+                                key: "weight".to_string(),
+                                value: Literal::Number("3".to_string()),
+                            }],
+                        },
+                        node: NodePattern {
+                            variable: None,
+                            labels: vec!["Database".to_string()],
+                            properties: vec![],
+                        },
+                    }],
+                }],
+            })
+        );
+        assert_eq!(
+            query.clauses[1],
+            Clause::Delete(super::DeleteClause {
+                detach: false,
+                expressions: vec![
+                    Expression::Identifier("r".to_string()),
+                    Expression::Literal(Literal::Bool(true)),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_empty_query_and_incomplete_clauses_with_positions() {
+        let error = parse("").expect_err("empty query should fail");
+        assert_eq!(error.message, "expected a query clause");
+        assert_eq!(error.line, 1);
+        assert_eq!(error.column, 1);
+
+        let error = parse("DETACH n").expect_err("DETACH without DELETE should fail");
+        assert_eq!(error.message, "expected DELETE after DETACH");
+        assert_eq!(error.line, 1);
+        assert_eq!(error.column, 8);
+
+        let error = parse("MATCH (n) RETURN n LIMIT foo").expect_err("non-numeric LIMIT should fail");
+        assert_eq!(error.message, "expected integer value after LIMIT");
+        assert_eq!(error.line, 1);
+        assert_eq!(error.column, 26);
+
+        let error = parse("RETURN n.").expect_err("dangling property access should fail");
+        assert_eq!(error.message, "expected property name after '.'");
+        assert_eq!(error.line, 1);
+        assert_eq!(error.column, 9);
+    }
 }
