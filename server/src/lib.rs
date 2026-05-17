@@ -1,6 +1,7 @@
 //! HTTP application bootstrap for the backend workspace member.
 
 pub mod config;
+pub mod db;
 
 use axum::{routing::get, Json, Router};
 use serde::Serialize;

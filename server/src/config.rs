@@ -1,54 +1,61 @@
 use std::{env, net::SocketAddr};
 
 /// Runtime configuration for the HTTP server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub bind_address: SocketAddr,
+    pub database_url: String,
+    pub seed_on_startup: bool,
 }
 
 impl Config {
     /// Loads configuration from environment variables.
-    pub fn from_env() -> Result<Self, ConfigError> {
-        let port = match env::var("PORT") {
-            Ok(value) => value
-                .parse::<u16>()
-                .map_err(|source| ConfigError::InvalidPort { value, source })?,
-            Err(env::VarError::NotPresent) => 8080,
-            Err(source) => return Err(ConfigError::ReadPort(source)),
-        };
+    pub fn from_env() -> Self {
+        let port = read_port();
+        let database_url = read_database_url();
+        let seed_on_startup = read_seed_on_startup();
 
-        Ok(Self {
+        Self {
             bind_address: SocketAddr::from(([0, 0, 0, 0], port)),
-        })
-    }
-}
-
-#[derive(Debug)]
-pub enum ConfigError {
-    ReadPort(env::VarError),
-    InvalidPort {
-        value: String,
-        source: std::num::ParseIntError,
-    },
-}
-
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ReadPort(_) => write!(f, "failed to read PORT from environment"),
-            Self::InvalidPort { value, .. } => {
-                write!(f, "PORT must be a valid u16 integer, got {value}")
-            }
+            database_url,
+            seed_on_startup,
         }
     }
 }
 
-impl std::error::Error for ConfigError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ReadPort(source) => Some(source),
-            Self::InvalidPort { source, .. } => Some(source),
-        }
+fn read_port() -> u16 {
+    match env::var("PORT") {
+        Ok(value) => match value.parse::<u16>() {
+            Ok(port) => port,
+            Err(error) => panic!("PORT must be a valid u16 integer, got {value}: {error}"),
+        },
+        Err(env::VarError::NotPresent) => 8080,
+        Err(error) => panic!("failed to read PORT from environment: {error}"),
+    }
+}
+
+fn read_database_url() -> String {
+    match env::var("DATABASE_URL") {
+        Ok(value) if !value.trim().is_empty() => value,
+        Ok(_) => panic!("DATABASE_URL must not be empty"),
+        Err(env::VarError::NotPresent) => panic!("DATABASE_URL is required"),
+        Err(error) => panic!("failed to read DATABASE_URL from environment: {error}"),
+    }
+}
+
+fn read_seed_on_startup() -> bool {
+    match env::var("SEED_ON_STARTUP") {
+        Ok(value) => parse_bool_env("SEED_ON_STARTUP", &value),
+        Err(env::VarError::NotPresent) => false,
+        Err(error) => panic!("failed to read SEED_ON_STARTUP from environment: {error}"),
+    }
+}
+
+fn parse_bool_env(name: &str, value: &str) -> bool {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => panic!("{name} must be a boolean value, got {value}"),
     }
 }
 
@@ -57,19 +64,32 @@ mod tests {
     use super::Config;
 
     #[test]
-    fn defaults_to_port_8080() {
+    fn defaults_to_port_8080_and_seed_flag_false() {
         unsafe {
             std::env::remove_var("PORT");
+            std::env::remove_var("SEED_ON_STARTUP");
+            std::env::set_var("DATABASE_URL", "postgres://postgres:postgres@localhost/test");
         }
 
-        let config_result = Config::from_env();
-        assert!(config_result.is_ok());
-
-        let config = match config_result {
-            Ok(config) => config,
-            Err(error) => panic!("config should load: {error}"),
-        };
+        let config = Config::from_env();
 
         assert_eq!(config.bind_address.port(), 8080);
+        assert!(!config.seed_on_startup);
+        assert_eq!(
+            config.database_url,
+            "postgres://postgres:postgres@localhost/test"
+        );
+    }
+
+    #[test]
+    fn parses_seed_flag_when_present() {
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgres://postgres:postgres@localhost/test");
+            std::env::set_var("SEED_ON_STARTUP", "true");
+        }
+
+        let config = Config::from_env();
+
+        assert!(config.seed_on_startup);
     }
 }
