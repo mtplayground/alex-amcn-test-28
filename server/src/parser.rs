@@ -13,6 +13,7 @@ pub enum Clause {
     Match(MatchClause),
     Where(WhereClause),
     Return(ReturnClause),
+    Limit(LimitClause),
     Delete(DeleteClause),
 }
 
@@ -34,6 +35,11 @@ pub struct WhereClause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReturnClause {
     pub items: Vec<Projection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitClause {
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +204,12 @@ impl Parser {
         if self.match_simple(|kind| matches!(kind, TokenKind::Return)) {
             return Ok(Clause::Return(ReturnClause {
                 items: self.parse_projection_list()?,
+            }));
+        }
+
+        if self.match_simple(|kind| matches!(kind, TokenKind::Limit)) {
+            return Ok(Clause::Limit(LimitClause {
+                count: self.parse_limit_count()?,
             }));
         }
 
@@ -458,6 +470,29 @@ impl Parser {
         }
     }
 
+    fn parse_limit_count(&mut self) -> Result<usize, ParserError> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Number(value) if !value.contains('.') => {
+                value.parse::<usize>().map_err(|_| ParserError {
+                    message: "LIMIT must be a non-negative integer".to_string(),
+                    line: token.line,
+                    column: token.column,
+                })
+            }
+            TokenKind::Number(_) => Err(ParserError {
+                message: "LIMIT must be a non-negative integer".to_string(),
+                line: token.line,
+                column: token.column,
+            }),
+            _ => Err(ParserError {
+                message: "expected integer value after LIMIT".to_string(),
+                line: token.line,
+                column: token.column,
+            }),
+        }
+    }
+
     fn parse_comparison_operator(&mut self) -> Option<BinaryOperator> {
         let operator = match &self.peek().kind {
             TokenKind::Equals => BinaryOperator::Equals,
@@ -559,8 +594,8 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse, BinaryOperator, Clause, Expression, Literal, NodePattern, Pattern, PatternChain,
-        Projection, Property, RelationshipPattern,
+        parse, BinaryOperator, Clause, Expression, LimitClause, Literal, NodePattern, Pattern,
+        PatternChain, Projection, Property, RelationshipPattern,
     };
 
     #[test]
@@ -570,6 +605,7 @@ mod tests {
              MATCH (person)-[rel:KNOWS]->(friend) \
              WHERE person.name = 'Alice' AND rel.since >= 2020 \
              RETURN person, friend.name, rel \
+             LIMIT 5 \
              DELETE rel",
         )
         .expect("query should parse");
@@ -690,6 +726,7 @@ mod tests {
                         },
                     ],
                 }),
+                Clause::Limit(LimitClause { count: 5 }),
                 Clause::Delete(super::DeleteClause {
                     detach: false,
                     expressions: vec![Expression::Identifier("rel".to_string())],
@@ -701,13 +738,17 @@ mod tests {
     #[test]
     fn parses_detach_delete_and_parenthesized_predicates() {
         let query = parse(
-            "MATCH (n:User) WHERE (n.active = true OR n.score > 10) AND n.name <> 'Bob' RETURN n DETACH DELETE n",
+            "MATCH (n:User) WHERE (n.active = true OR n.score > 10) AND n.name <> 'Bob' RETURN n LIMIT 10 DETACH DELETE n",
         )
         .expect("query should parse");
 
-        assert_eq!(query.clauses.len(), 4);
+        assert_eq!(query.clauses.len(), 5);
         assert_eq!(
             query.clauses[3],
+            Clause::Limit(LimitClause { count: 10 })
+        );
+        assert_eq!(
+            query.clauses[4],
             Clause::Delete(super::DeleteClause {
                 detach: true,
                 expressions: vec![Expression::Identifier("n".to_string())],
@@ -731,5 +772,12 @@ mod tests {
         assert_eq!(error.message, "unterminated string literal");
         assert_eq!(error.line, 1);
         assert_eq!(error.column, 17);
+    }
+
+    #[test]
+    fn rejects_non_integer_limit_values() {
+        let error = parse("MATCH (n) RETURN n LIMIT 1.5").expect_err("query should fail");
+
+        assert_eq!(error.message, "LIMIT must be a non-negative integer");
     }
 }

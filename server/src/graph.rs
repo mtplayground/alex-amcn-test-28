@@ -135,6 +135,21 @@ impl GraphIndex {
         rel_ids
     }
 
+    pub fn outgoing_rel_ids(&self, node_id: NodeId) -> Vec<RelId> {
+        let Some(node_index) = self.node_indices.get(&node_id).copied() else {
+            return Vec::new();
+        };
+
+        let mut rel_ids = self
+            .graph
+            .edges_directed(node_index, Direction::Outgoing)
+            .map(|edge| *edge.weight())
+            .collect::<Vec<_>>();
+        rel_ids.sort_unstable();
+        rel_ids.dedup();
+        rel_ids
+    }
+
     fn rebuild_mappings(&mut self) {
         self.node_indices = self
             .graph
@@ -207,6 +222,22 @@ mod tests {
         assert_eq!(index.incident_rel_ids(1), vec![11, 12]);
         assert_eq!(index.incident_rel_ids(2), vec![12]);
         assert!(index.incident_rel_ids(99).is_empty());
+    }
+
+    #[test]
+    fn outgoing_relationship_lookup_returns_sorted_unique_ids() {
+        let mut index = GraphIndex::new();
+
+        index.add_node(1);
+        index.add_node(2);
+        index.add_node(3);
+        index.add_rel(12, 1, 2);
+        index.add_rel(11, 3, 1);
+        index.add_rel(10, 1, 3);
+
+        assert_eq!(index.outgoing_rel_ids(1), vec![10, 12]);
+        assert_eq!(index.outgoing_rel_ids(3), vec![11]);
+        assert!(index.outgoing_rel_ids(99).is_empty());
     }
 
     #[tokio::test]
