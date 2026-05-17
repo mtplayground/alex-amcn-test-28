@@ -26,9 +26,8 @@ fn api_router() -> Router {
     Router::new().route("/health", get(health_check))
 }
 
-fn spa_service() -> ServeDir {
-    ServeDir::new("frontend/dist")
-        .not_found_service(ServeFile::new("frontend/dist/index.html"))
+fn spa_service() -> ServeDir<ServeFile> {
+    ServeDir::new("frontend/dist").fallback(ServeFile::new("frontend/dist/index.html"))
 }
 
 #[derive(Debug, Serialize)]
