@@ -2,7 +2,7 @@ use crate::domain::{Node, Properties, Relationship, Value};
 use serde_json::Value as JsonValue;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 /// Builds the shared PostgreSQL connection pool.
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
@@ -23,6 +23,35 @@ impl NodeRepo {
     }
 
     pub async fn insert(
+        &self,
+        labels: Vec<String>,
+        properties: Properties,
+    ) -> Result<Node, sqlx::Error> {
+        self.insert_in_txless(labels, properties).await
+    }
+
+    pub async fn insert_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        labels: Vec<String>,
+        properties: Properties,
+    ) -> Result<Node, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO nodes (labels, properties)
+            VALUES ($1, $2)
+            RETURNING id, labels, properties
+            "#,
+        )
+        .bind(labels)
+        .bind(Json(properties))
+        .fetch_one(&mut **transaction)
+        .await?;
+
+        node_from_row(&row)
+    }
+
+    async fn insert_in_txless(
         &self,
         labels: Vec<String>,
         properties: Properties,
@@ -122,6 +151,42 @@ impl RelRepo {
     }
 
     pub async fn insert(
+        &self,
+        rel_type: String,
+        start_id: i64,
+        end_id: i64,
+        properties: Properties,
+    ) -> Result<Relationship, sqlx::Error> {
+        self.insert_in_txless(rel_type, start_id, end_id, properties)
+            .await
+    }
+
+    pub async fn insert_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        rel_type: String,
+        start_id: i64,
+        end_id: i64,
+        properties: Properties,
+    ) -> Result<Relationship, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO relationships (type, start_id, end_id, properties)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, type, start_id, end_id, properties
+            "#,
+        )
+        .bind(rel_type)
+        .bind(start_id)
+        .bind(end_id)
+        .bind(Json(properties))
+        .fetch_one(&mut **transaction)
+        .await?;
+
+        relationship_from_row(&row)
+    }
+
+    async fn insert_in_txless(
         &self,
         rel_type: String,
         start_id: i64,
