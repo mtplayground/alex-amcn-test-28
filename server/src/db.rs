@@ -161,6 +161,20 @@ impl RelRepo {
         rows.iter().map(relationship_from_row).collect()
     }
 
+    pub async fn list(&self) -> Result<Vec<Relationship>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, type, start_id, end_id, properties
+            FROM relationships
+            ORDER BY id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(relationship_from_row).collect()
+    }
+
     pub async fn delete_by_node(&self, node_id: i64) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r#"
