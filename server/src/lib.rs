@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod db;
+pub mod domain;
 
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
