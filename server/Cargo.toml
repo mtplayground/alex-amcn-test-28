@@ -8,3 +8,19 @@ rust-version.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "zeroclaw-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+http = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
