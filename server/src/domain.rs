@@ -2,21 +2,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value as JsonValue};
 
 pub type Properties = Map<String, JsonValue>;
+pub type NodeId = i64;
+pub type RelId = i64;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
-    pub id: i64,
+    pub id: NodeId,
     pub labels: Vec<String>,
     pub properties: Properties,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Relationship {
-    pub id: i64,
+    pub id: RelId,
     #[serde(rename = "type")]
     pub r#type: String,
-    pub start_id: i64,
-    pub end_id: i64,
+    pub start_id: NodeId,
+    pub end_id: NodeId,
     pub properties: Properties,
 }
 
