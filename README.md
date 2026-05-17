@@ -55,3 +55,15 @@ npm run dev
 
 The Vite dev server listens on `0.0.0.0:5173` and proxies `/api` requests to
 the backend on `http://127.0.0.1:8080`.
+
+For the Axum server to serve the SPA directly, build the frontend first:
+
+```bash
+cd frontend
+npm run build
+cd ..
+cargo run -p zeroclaw-server
+```
+
+The backend serves files from `frontend/dist`, falls back to `index.html` for
+SPA routes, and keeps API endpoints mounted under `/api`.
