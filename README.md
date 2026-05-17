@@ -22,4 +22,17 @@ server and database integration without restructuring the repository.
 cargo build
 ```
 
-This validates the Rust workspace layout and the `server` crate scaffold.
+This validates the Rust workspace layout and the `server` crate.
+
+To run the HTTP server locally:
+
+```bash
+PORT=8080 cargo run -p zeroclaw-server
+```
+
+The server binds to `0.0.0.0:$PORT` and exposes `GET /api/health`, which
+returns:
+
+```json
+{"status":"ok"}
+```
