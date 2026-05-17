@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use petgraph::Direction;
 use petgraph::graph::{EdgeIndex, Graph, NodeIndex};
+use petgraph::Direction;
 use sqlx::PgPool;
 
 use crate::{
@@ -250,7 +250,12 @@ mod tests {
         assert!(index.contains_node(beta.id));
 
         let relationship = rel_repo
-            .insert("DEPENDS_ON".to_string(), alpha.id, beta.id, Properties::new())
+            .insert(
+                "DEPENDS_ON".to_string(),
+                alpha.id,
+                beta.id,
+                Properties::new(),
+            )
             .await
             .expect("relationship insert should succeed");
         index.add_rel(relationship.id, relationship.start_id, relationship.end_id);

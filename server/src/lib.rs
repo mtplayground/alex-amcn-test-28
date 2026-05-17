@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod domain;
 pub mod graph;
+pub mod lexer;
 
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
