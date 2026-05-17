@@ -13,7 +13,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let pool = create_pool(&config.database_url).await?;
     let listener = TcpListener::bind(config.bind_address).await?;
 
-    info!(seed_on_startup = config.seed_on_startup, "database pool established");
+    info!(
+        seed_on_startup = config.seed_on_startup,
+        "database pool established"
+    );
     info!(address = %config.bind_address, "server listening");
 
     let _pool = pool;

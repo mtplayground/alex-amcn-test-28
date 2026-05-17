@@ -62,13 +62,20 @@ fn parse_bool_env(name: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn defaults_to_port_8080_and_seed_flag_false() {
+        let _guard = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
             std::env::remove_var("PORT");
             std::env::remove_var("SEED_ON_STARTUP");
-            std::env::set_var("DATABASE_URL", "postgres://postgres:postgres@localhost/test");
+            std::env::set_var(
+                "DATABASE_URL",
+                "postgres://postgres:postgres@localhost/test",
+            );
         }
 
         let config = Config::from_env();
@@ -83,8 +90,12 @@ mod tests {
 
     #[test]
     fn parses_seed_flag_when_present() {
+        let _guard = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
-            std::env::set_var("DATABASE_URL", "postgres://postgres:postgres@localhost/test");
+            std::env::set_var(
+                "DATABASE_URL",
+                "postgres://postgres:postgres@localhost/test",
+            );
             std::env::set_var("SEED_ON_STARTUP", "true");
         }
 
