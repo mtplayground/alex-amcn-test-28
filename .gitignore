@@ -1,8 +1,12 @@
 target/
 node_modules/
+dist/
+.DS_Store
 .gh_token
 .claude/
 .database_url
+.db_decision
+.env.production
 .task_id
 .container_name
 .app_name
@@ -11,3 +15,4 @@ node_modules/
 .pipeline-state.json
 .gitkeep
 .progress
+coverage/
