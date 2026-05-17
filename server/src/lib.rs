@@ -5,6 +5,7 @@ pub mod db;
 
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 /// Returns the backend workspace member name.
@@ -15,8 +16,18 @@ pub fn crate_name() -> &'static str {
 /// Builds the application router.
 pub fn app() -> Router {
     Router::new()
-        .route("/api/health", get(health_check))
+        .nest("/api", api_router())
+        .fallback_service(spa_service())
         .layer(TraceLayer::new_for_http())
+}
+
+fn api_router() -> Router {
+    Router::new().route("/health", get(health_check))
+}
+
+fn spa_service() -> ServeDir {
+    ServeDir::new("frontend/dist")
+        .not_found_service(ServeFile::new("frontend/dist/index.html"))
 }
 
 #[derive(Debug, Serialize)]
