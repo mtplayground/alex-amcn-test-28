@@ -44,3 +44,14 @@ returns:
 ```json
 {"status":"ok"}
 ```
+
+To run the frontend locally:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The Vite dev server listens on `0.0.0.0:5173` and proxies `/api` requests to
+the backend on `http://127.0.0.1:8080`.
